@@ -1,0 +1,97 @@
+# Builds and publishes the fork's `deploy` branch (kept in sync with upstream's newest
+# release/* branch by sync-latest-release.yml) to GHCR. Render can then track either the
+# `deploy` branch directly, or this image via the `latest-release` tag.
+name: Build and Push GHCR Image
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch: {}
+
+# Least-privilege default; the build job elevates to packages: write to push the image.
+permissions:
+  contents: read
+
+env:
+  # ghcr.io/<owner>/<repo>, lowercased (GHCR requires lowercase image names).
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+
+jobs:
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout deploy branch
+        uses: actions/checkout@v7
+        with:
+          ref: deploy
+          persist-credentials: false
+
+      - name: Detect release version from deploy branch's origin
+        id: version
+        run: |
+          set -euo pipefail
+          # deploy is a hard mirror of an upstream release/vX.Y.Z branch; read the version
+          # straight out of package.json so the image tag matches what actually got built,
+          # rather than re-deriving it from a branch name we don't have here.
+          version="v$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Lowercase image name
+        id: image
+        run: |
+          set -euo pipefail
+          echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest-release
+            type=raw,value=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=omniroute
+            org.opencontainers.image.description=Unified AI proxy/router — synced from upstream release
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runner-base
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Build and Push GHCR Image"
+            echo ""
+            echo "- Image: \`${{ steps.image.outputs.name }}\`"
+            echo "- Tags: \`latest-release\`, \`${{ steps.version.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
