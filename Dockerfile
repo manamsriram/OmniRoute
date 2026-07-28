@@ -45,6 +45,7 @@ COPY open-sse/package.json ./open-sse/package.json
 COPY scripts/build/postinstall.mjs ./scripts/build/postinstall.mjs
 COPY scripts/build/postinstallSupport.mjs ./scripts/build/postinstallSupport.mjs
 COPY scripts/build/native-binary-compat.mjs ./scripts/build/native-binary-compat.mjs
+COPY scripts/build/tlsClientPostinstallWithAuth.mjs ./scripts/build/tlsClientPostinstallWithAuth.mjs
 ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
 # --ignore-scripts blocks broad dependency install/postinstall hooks, closing
 # the supply-chain attack surface where a transitive dep can run arbitrary code
@@ -76,12 +77,21 @@ RUN test -f package-lock.json \
 # in production (TlsClientUnavailableError, #7802). Run it explicitly here so
 # a broken/rate-limited fetch fails the BUILD loudly instead of shipping a
 # broken image.
+#
+# tls-client-node's postinstall calls api.github.com unauthenticated (60 req/hr
+# per IP), which shared CI runner IPs exhaust fast. It has no built-in way to
+# send an auth token, so scripts/build/tlsClientPostinstallWithAuth.mjs wraps it
+# and attaches an optional GITHUB_TOKEN via a BuildKit secret (never baked into
+# an image layer/ARG). Passing no secret is a no-op — the wrapper just runs the
+# script unauthenticated, same as before.
 RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
+  --mount=type=secret,id=github_token \
   npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
-  && node node_modules/tls-client-node/scripts/postinstall.js \
+  && GITHUB_TOKEN="$(cat /run/secrets/github_token 2>/dev/null || true)" \
+     node scripts/build/tlsClientPostinstallWithAuth.mjs \
   && (test -n "$(find node_modules/tls-client-node/bin -mindepth 1 -print -quit 2>/dev/null)" \
       || (echo "tls-client-node native binary missing after postinstall — GitHub API fetch likely rate-limited or failed (#7802)" >&2 && exit 1))
 
