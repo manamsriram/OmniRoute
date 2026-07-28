@@ -1,0 +1,74 @@
+# Follows upstream OmniRoute's newest `release/*` branch (name changes every release,
+# e.g. release/v3.8.48 -> release/v3.8.49) and mirrors it into a stable `deploy` branch
+# on this fork. `deploy` is what Render / build-ghcr.yml build from, so neither of those
+# ever needs to know the current upstream branch name.
+name: Sync Latest Upstream Release
+
+on:
+  schedule:
+    # Every 6 hours. Cron is UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+# Least-privilege default; the job below elevates to contents: write to push `deploy`.
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/diegosouzapw/OmniRoute.git
+
+jobs:
+  sync:
+    name: Sync deploy branch from upstream release/*
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      branch: ${{ steps.detect.outputs.branch }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          # Need full history + all refs so we can create/force-update `deploy` locally
+          # and push it; a shallow checkout can't reliably fetch+push arbitrary branches.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Detect newest upstream release/* branch
+        id: detect
+        run: |
+          set -euo pipefail
+          ./scripts/find_latest_release_branch.sh "$UPSTREAM_URL" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Fetch detected upstream release branch
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "${{ steps.detect.outputs.branch }}"
+
+      - name: Force-update local deploy branch to match upstream release branch exactly
+        run: |
+          set -euo pipefail
+          git checkout -B deploy "upstream/${{ steps.detect.outputs.branch }}"
+
+      - name: Configure git identity for push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Push deploy branch to origin
+        run: |
+          set -euo pipefail
+          git push origin deploy --force
+
+      - name: Summary
+        run: |
+          {
+            echo "### Sync Latest Upstream Release"
+            echo ""
+            echo "- Upstream branch: \`${{ steps.detect.outputs.branch }}\`"
+            echo "- Version: \`${{ steps.detect.outputs.version }}\`"
+            echo "- Fork's \`deploy\` branch now matches upstream exactly."
+          } >> "$GITHUB_STEP_SUMMARY"
