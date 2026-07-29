@@ -105,6 +105,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # `secrets` context is not allowed directly in step `if:` conditions — route
+      # presence checks through job-level `env` instead.
+      RENDER_DEPLOY_HOOK_SET: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+      OCI_SSH_SET: ${{ secrets.OCI_SSH_HOST != '' }}
     steps:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -129,7 +134,7 @@ jobs:
             "${IMAGE}:${VERSION}-arm64"
 
       - name: Trigger Render deploy
-        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+        if: ${{ env.RENDER_DEPLOY_HOOK_SET == 'true' }}
         env:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
@@ -139,7 +144,7 @@ jobs:
           curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
 
       - name: Redeploy on Oracle Cloud VM
-        if: ${{ secrets.OCI_SSH_HOST != '' }}
+        if: ${{ env.OCI_SSH_SET == 'true' }}
         env:
           OCI_SSH_HOST: ${{ secrets.OCI_SSH_HOST }}
           OCI_SSH_USER: ${{ secrets.OCI_SSH_USER }}
