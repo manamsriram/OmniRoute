@@ -1,6 +1,6 @@
 # Builds and publishes the fork's `deploy` branch (kept in sync with upstream's newest
-# release/* branch by sync-latest-release.yml) to GHCR. Render can then track either the
-# `deploy` branch directly, or this image via the `latest-release` tag.
+# release/* branch by sync-latest-release.yml) to GHCR as a multi-arch (amd64 + arm64)
+# image, then optionally redeploys wherever it's running (Render hook, Oracle VM over SSH).
 name: Build and Push GHCR Image
 
 on:
@@ -8,7 +8,7 @@ on:
     branches: [deploy]
   workflow_dispatch: {}
 
-# Least-privilege default; the build job elevates to packages: write to push the image.
+# Least-privilege default; the build jobs elevate to packages: write to push the image.
 permissions:
   contents: read
 
@@ -18,11 +18,26 @@ env:
 
 jobs:
   build:
-    name: Build and Push Image
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.platform }})
+    strategy:
+      matrix:
+        include:
+          # Native arm64 runner — avoids the QEMU-emulation OOM that killed the earlier
+          # emulated `linux/arm64` build under `npm run build` on a memory-constrained
+          # emulated CPU (see git history on this workflow).
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
       packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.image.outputs.name }}
     steps:
       - name: Checkout deploy branch
         uses: actions/checkout@v7
@@ -56,14 +71,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
+      - name: Build and push per-arch image
+        uses: docker/build-push-action@v7
         with:
-          images: ${{ steps.image.outputs.name }}
+          context: .
+          target: runner-base
+          platforms: ${{ matrix.platform }}
+          push: true
+          # Per-arch tags only — combined into the multi-arch latest-release/vX.Y.Z
+          # manifest by the merge job below. Never publish these arch-suffixed tags
+          # as something users are meant to pull directly.
           tags: |
-            type=raw,value=latest-release
-            type=raw,value=${{ steps.version.outputs.version }}
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.version }}-${{ matrix.suffix }}
           labels: |
             org.opencontainers.image.title=omniroute
             org.opencontainers.image.description=Unified AI proxy/router — synced from upstream release
@@ -71,29 +90,77 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.licenses=MIT
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: runner-base
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
           # Authenticates the tls-client-node postinstall's api.github.com call
           # (see Dockerfile) so it gets 5000 req/hr instead of the 60/hr
           # unauthenticated limit that shared runner IPs exhaust.
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
 
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create and push multi-arch manifest
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest-release" \
+            -t "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+      - name: Trigger Render deploy
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          # Render pulls a floating tag (latest-release) on deploy-hook trigger; it does
+          # not watch GHCR for new pushes on its own. No secret set = step is a no-op.
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
+
+      - name: Redeploy on Oracle Cloud VM
+        if: ${{ secrets.OCI_SSH_HOST != '' }}
+        env:
+          OCI_SSH_HOST: ${{ secrets.OCI_SSH_HOST }}
+          OCI_SSH_USER: ${{ secrets.OCI_SSH_USER }}
+          OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          # No secrets set = step is a no-op (this `if:` gates the whole step).
+          install -m 600 /dev/null /tmp/oci_ssh_key
+          printf '%s\n' "$OCI_SSH_KEY" > /tmp/oci_ssh_key
+          ssh -o StrictHostKeyChecking=accept-new -i /tmp/oci_ssh_key \
+            "${OCI_SSH_USER}@${OCI_SSH_HOST}" 'bash ~/omniroute-deploy.sh'
+          rm -f /tmp/oci_ssh_key
+
       - name: Summary
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           {
             echo "### Build and Push GHCR Image"
             echo ""
-            echo "- Image: \`${{ steps.image.outputs.name }}\`"
-            echo "- Tags: \`latest-release\`, \`${{ steps.version.outputs.version }}\`"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Tags: \`latest-release\`, \`${VERSION}\` (multi-arch: amd64 + arm64)"
           } >> "$GITHUB_STEP_SUMMARY"
